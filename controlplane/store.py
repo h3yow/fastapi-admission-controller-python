@@ -3,24 +3,34 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import time
 from typing import Any
 
 from .admission import AdmissionController
 from .errors import AlreadyExistsError, ConflictError, DeletingError, NotFoundError
 from .models import Resource
+from .quota import Quota, QuotaManager, Usage
+
+logger = logging.getLogger("controlplane.quota")
 
 
 class ResourceStore:
     """进程内资源存储。
 
     并发语义：所有变更操作都在同一把 asyncio.Lock 内完成
-    「读取当前版本 -> 准入/版本校验 -> 写入」，因此并发写入被串行化，
-    基于过期 resource_version 的写入必然以 Conflict 失败，不会静默覆盖。
+    「读取当前版本 -> 准入/版本校验/配额校验 -> 写入」，因此并发写入被串行化，
+    基于过期 resource_version 的写入必然以 Conflict 失败，不会静默覆盖；
+    配额的「扫描真实用量 -> 判定 -> 提交」同样在该临界区内完成，不会超卖。
     """
 
-    def __init__(self, admission: AdmissionController) -> None:
+    def __init__(
+        self,
+        admission: AdmissionController,
+        quota: QuotaManager | None = None,
+    ) -> None:
         self.admission = admission
+        self.quota = quota or QuotaManager()
         self._resources: dict[str, Resource] = {}
         self._lock = asyncio.Lock()
 
@@ -34,9 +44,17 @@ class ResourceStore:
                     f"resource {key} already exists",
                     details={"namespace": namespace, "name": name},
                 )
+            # 配额门槛：基于服务端当下真实用量判定，通过后才提交；
+            # 拒绝在插入之前抛出，不占额度、不留半成品。
+            current = self.quota.check_create(namespace, spec, self._resources.values())
             resource = Resource(namespace=namespace, name=name, spec=copy.deepcopy(spec))
             resource.resource_version = 1
             self._resources[key] = resource
+            logger.info(
+                "create admitted ns=%s name=%s replicas=%s used=(count=%d,repl=%d)",
+                namespace, name, spec.get("replicas", 0),
+                current.resource_count, current.replica_total,
+            )
             return resource
 
     async def update(
@@ -64,9 +82,20 @@ class ResourceStore:
                         "current": resource.resource_version,
                     },
                 )
+            # 配额门槛（提交前最后一道关）：副本数按增量结算；
+            # 调小/持平始终放行，调大且超上限才拒绝。拒绝不触碰任何状态。
+            current = self.quota.check_update(
+                namespace, resource, spec, self._resources.values()
+            )
+            old_replicas = resource.spec.get("replicas", 0)
             resource.spec = copy.deepcopy(spec)
             resource.resource_version += 1
             resource.updated_at = time.time()
+            logger.info(
+                "update admitted ns=%s name=%s replica_delta=%d used=(count=%d,repl=%d)",
+                namespace, name, spec.get("replicas", 0) - old_replicas,
+                current.resource_count, current.replica_total,
+            )
             return resource
 
     async def delete(self, namespace: str, name: str) -> Resource:
@@ -85,6 +114,12 @@ class ResourceStore:
             resource.applied = None  # 残留清理：回收实际状态
             resource.resource_version += 1
             resource.updated_at = time.time()
+            # 删除一旦接受，该资源即刻退出用量集合（deleting 不再被扫描计入），
+            # 条数与副本额度同步释放；重复删除在此之前幂等返回，不会重复释放。
+            logger.info(
+                "delete admitted ns=%s name=%s released replicas=%s",
+                namespace, name, resource.spec.get("replicas", 0),
+            )
             return resource
 
     async def get(self, namespace: str, name: str) -> Resource:
@@ -94,6 +129,23 @@ class ResourceStore:
     async def list(self) -> list[Resource]:
         async with self._lock:
             return list(self._resources.values())
+
+    async def set_quota(self, namespace: str, quota: Quota) -> None:
+        """按命名空间调整配额。下调到低于当前用量也允许：不删除、不改动既有资源。"""
+        async with self._lock:
+            self.admission.validate_namespace(namespace)
+            self.quota.set_quota(namespace, quota)
+            logger.info("quota updated ns=%s quota=%s", namespace, quota)
+
+    async def usage(self, namespace: str) -> Usage:
+        """查询命名空间当前真实用量（只计未删除中的资源）。"""
+        async with self._lock:
+            return self.quota.usage(namespace, self._resources.values())
+
+    async def capacity(self, namespace: str) -> dict:
+        """查询容量信息：上限、当前用量、是否超配。"""
+        async with self._lock:
+            return self.quota.capacity(namespace, self._resources.values())
 
     async def reconcile(self, namespace: str, name: str) -> Resource:
         """调和单个资源：让实际状态收敛到期望状态（幂等）。

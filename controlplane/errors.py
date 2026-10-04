@@ -64,3 +64,15 @@ class DeletingError(ControlPlaneError):
 
     reason = "ResourceDeleting"
     status_code = 409
+
+
+class QuotaExceededError(ControlPlaneError):
+    """写入会使命名空间用量超过配额上限。
+
+    与字段非法（InvalidSpec/422）、标识冲突（AlreadyExists/409）、
+    越权（ForbiddenNamespace/403）通过独立的 reason 与状态码区分；
+    details 中说明超限的配额类别、当前用量、上限与本次增量。
+    """
+
+    reason = "QuotaExceeded"
+    status_code = 429

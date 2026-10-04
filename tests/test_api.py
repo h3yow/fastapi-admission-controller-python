@@ -57,3 +57,44 @@ async def test_error_reasons_are_distinguishable(client):
         resp = await getattr(client, method)(url, json=body) if body else await getattr(client, method)(url)
         assert resp.status_code == expected_status
         assert resp.json()["reason"] == expected_reason
+
+
+async def test_quota_enforced_over_http(client):
+    log_case("HTTP quota", {"namespace": "team-a", "default": "5 resources / 20 replicas"},
+             "副本合计到 20 后继续放大 -> 429 QuotaExceeded，details 可解释；容量接口返回上限/用量/超配")
+    # 用 5 个资源把副本合计打到 20（4*5）。
+    for i in range(5):
+        resp = await client.post("/resources/team-a",
+                                 json={"name": f"w{i}",
+                                       "spec": {"image": "nginx:1.27", "replicas": 4}})
+        assert resp.status_code == 201
+
+    resp = await client.get("/quotas/team-a")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["limits"] == {"maxResources": 5, "maxReplicas": 20}
+    assert body["usage"] == {"resourceCount": 5, "replicaTotal": 20}
+    assert body["overQuota"] is False
+
+    # 第 6 个资源：条数超限 -> 429。
+    resp = await client.post("/resources/team-a",
+                             json={"name": "w5", "spec": {"image": "nginx:1.27"}})
+    assert resp.status_code == 429
+    err = resp.json()
+    assert err["reason"] == "QuotaExceeded"
+    assert err["details"]["quotaType"] == "resources"
+    assert err["details"]["used"] == 5 and err["details"]["limit"] == 5
+
+    # 调小配额到 1/10 -> 立即超配，但只读与缩容仍可用。
+    resp = await client.put("/quotas/team-a", json={"maxResources": 1, "maxReplicas": 10})
+    assert resp.status_code == 200
+    assert resp.json()["overQuota"] is True
+
+    # 放大被拒（429），调小放行（200）。
+    resp = await client.put("/resources/team-a/w0",
+                            json={"spec": {"image": "nginx:1.27", "replicas": 5}})
+    assert resp.status_code == 429
+    assert resp.json()["details"]["quotaType"] == "replicas"
+    resp = await client.put("/resources/team-a/w0",
+                            json={"spec": {"image": "nginx:1.27", "replicas": 1}})
+    assert resp.status_code == 200

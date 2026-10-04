@@ -5,10 +5,11 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .admission import AdmissionController
 from .errors import ControlPlaneError
+from .quota import Quota
 from .store import ResourceStore
 
 
@@ -20,6 +21,11 @@ class CreateRequest(BaseModel):
 class UpdateRequest(BaseModel):
     spec: dict[str, Any]
     resourceVersion: int | None = None  # 携带则启用乐观并发控制
+
+
+class QuotaUpdateRequest(BaseModel):
+    maxResources: int = Field(ge=0)
+    maxReplicas: int = Field(ge=0)
 
 
 def create_app(store: ResourceStore | None = None) -> FastAPI:
@@ -58,6 +64,18 @@ def create_app(store: ResourceStore | None = None) -> FastAPI:
     @app.get("/resources")
     async def list_resources():
         return {"items": [r.to_dict() for r in await store.list()]}
+
+    @app.get("/quotas/{namespace}")
+    async def get_quota(namespace: str):
+        # 容量视图：上限、当前用量、是否超配一并返回。
+        return await store.capacity(namespace)
+
+    @app.put("/quotas/{namespace}")
+    async def update_quota(namespace: str, body: QuotaUpdateRequest):
+        # 按命名空间调整配额；允许下调到低于当前用量（不删改既有资源）。
+        quota = Quota(max_resources=body.maxResources, max_replicas=body.maxReplicas)
+        await store.set_quota(namespace, quota)
+        return await store.capacity(namespace)
 
     @app.post("/reconcile")
     async def reconcile_all():
