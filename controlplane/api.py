@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .admission import AdmissionController
-from .errors import ControlPlaneError
+from .errors import ControlPlaneError, InvalidSpecError
 from .store import ResourceStore
 
 
@@ -20,6 +20,11 @@ class CreateRequest(BaseModel):
 class UpdateRequest(BaseModel):
     spec: dict[str, Any]
     resourceVersion: int | None = None  # 携带则启用乐观并发控制
+
+
+class QuotaRequest(BaseModel):
+    maxResources: int
+    maxReplicas: int
 
 
 def create_app(store: ResourceStore | None = None) -> FastAPI:
@@ -68,5 +73,18 @@ def create_app(store: ResourceStore | None = None) -> FastAPI:
     async def reconcile_one(namespace: str, name: str):
         resource = await store.reconcile(namespace, name)
         return resource.to_dict()
+
+    @app.get("/quotas/{namespace}")
+    async def get_quota(namespace: str):
+        return await store.quota_status(namespace)
+
+    @app.put("/quotas/{namespace}")
+    async def put_quota(namespace: str, body: QuotaRequest):
+        if body.maxResources < 0 or body.maxReplicas < 0:
+            raise InvalidSpecError(
+                "quota limits must be non-negative",
+                details={"maxResources": body.maxResources, "maxReplicas": body.maxReplicas},
+            )
+        return await store.set_quota(namespace, body.maxResources, body.maxReplicas)
 
     return app

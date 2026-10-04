@@ -10,6 +10,7 @@ controlplane/
 ├── models.py      # 资源数据模型与 spec 字段白名单/类型/不可变字段定义
 ├── errors.py      # 可区分的错误类型（reason + HTTP 状态码）
 ├── admission.py   # 准入控制器：纯校验，不产生任何状态变化
+├── quota.py       # 配额治理：命名空间上限、用量口径与超配判定
 ├── store.py       # 版本化存储：锁内「读版本->校验->写入」，乐观并发控制
 ├── reconciler.py  # 后台调和循环（测试中可手动触发单轮）
 └── api.py         # HTTP 层：REST 端点 + 统一错误响应
@@ -39,9 +40,60 @@ controlplane/
 | 资源不存在 | `NotFound` | 404 |
 | 基于过期 `resourceVersion` 的写入 | `Conflict` | 409 |
 | 更新删除中的资源 | `ResourceDeleting` | 409 |
+| 命名空间配额超限（条数或副本合计） | `QuotaExceeded` | 403 |
 
 错误响应统一为 `{"reason": ..., "message": ..., "details": {...}}`，
-`details` 携带判定依据（如冲突的期望/当前版本号、被变更的不可变字段）。
+`details` 携带判定依据（如冲突的期望/当前版本号、被变更的不可变字段、
+超限的配额类别/当前用量/上限）。
+
+## 配额治理
+
+配额是**服务端强制的写入门槛**：判定发生在存储锁内、任何状态变化之前，
+被拒绝的请求不占用额度、不留下半成品状态。
+
+### 上限与默认值
+
+每个命名空间有两类上限，均可按命名空间单独覆盖（`PUT /quotas/{namespace}`）：
+
+| 上限 | 默认值 | 含义 |
+|---|---|---|
+| `maxResources` | 5 | 该命名空间下资源条数上限 |
+| `maxReplicas` | 20 | 该命名空间下所有资源副本数合计上限 |
+
+### 用量口径
+
+- **计入对象**：命名空间下所有未处于删除中（`deleting=false`）的资源；
+  `spec.replicas` 缺省按 1 计入。
+- **计入时机**：每次写入准入判定时，基于存储内当下的真实资源集合现算；
+  判定与写入在同一把锁内完成，并发写入被串行化，**不会超卖**。
+- **增量结算**：更新按 `delta = 新副本数 - 旧副本数` 结算；
+  `delta <= 0`（调小或不变）必然放行。
+- **释放时机**：删除被接受（标记 `deleting`）的瞬间即释放额度；
+  重复删除幂等，不重复释放；删除中的资源不再计入后续核算。
+- **无独立台账**：用量始终由权威状态现算，重复执行结论收敛，
+  不存在额度越用越少的泄漏。
+
+### 超配（配额低于当前用量）
+
+把配额调低到当前用量之下是允许的，此时：
+
+- 既有资源**不会被自动删除或修改**，仍可正常读取；
+- 容量查询返回 `overQuota: true`；
+- **收缩性写入放行**：调小副本数、删除资源；
+- **放大性写入拒绝**：调大副本数、新建资源，直到用量回落到上限以内。
+
+### 容量查询
+
+`GET /quotas/{namespace}` 返回：
+
+```json
+{
+  "namespace": "team-a",
+  "limits": {"maxResources": 5, "maxReplicas": 20},
+  "usage": {"resources": 2, "replicas": 6},
+  "overQuota": false
+}
+```
 
 ## 调和语义
 
@@ -76,6 +128,8 @@ controlplane/
 | GET | `/resources/{namespace}/{name}` | 查询单个 |
 | GET | `/resources` | 列出全部 |
 | POST | `/reconcile` / `/reconcile/{namespace}/{name}` | 触发调和 |
+| GET | `/quotas/{namespace}` | 查询容量（上限 + 用量 + 是否超配） |
+| PUT | `/quotas/{namespace}` | 调整命名空间配额（body: `{maxResources, maxReplicas}`） |
 
 ## 运行与验证
 
@@ -83,7 +137,8 @@ controlplane/
 # 启动服务
 uv run python main.py        # 或 uv run uvicorn main:app
 
-# 运行测试（30 个用例，覆盖准入拒绝、并发写入、版本冲突、调和幂等、删除清理）
+# 运行测试（39 个用例，覆盖准入拒绝、并发写入、版本冲突、调和幂等、删除清理、
+# 配额超限拒绝/并发不超卖/增量结算/删除释放/超配恢复）
 uv run pytest -q
 
 # 查看单测日志中的输入与判定依据
@@ -105,4 +160,16 @@ curl -X PUT localhost:8000/resources/team-a/web \
 curl -X PUT localhost:8000/resources/team-a/web \
   -H 'Content-Type: application/json' \
   -d '{"spec": {"image": "nginx:1.27", "replicas": 9}, "resourceVersion": 1}'
+
+# 查询容量 -> limits + usage + overQuota
+curl localhost:8000/quotas/team-a
+
+# 调小配额到副本合计 2 -> 之后的放大写入返回 403 QuotaExceeded
+curl -X PUT localhost:8000/quotas/team-a \
+  -H 'Content-Type: application/json' \
+  -d '{"maxResources": 5, "maxReplicas": 2}'
+curl -X PUT localhost:8000/resources/team-a/web \
+  -H 'Content-Type: application/json' \
+  -d '{"spec": {"image": "nginx:1.27", "replicas": 3}}'
+# -> {"reason": "QuotaExceeded", "details": {"quota": "replicas", "used": ..., "limit": 2, ...}}
 ```

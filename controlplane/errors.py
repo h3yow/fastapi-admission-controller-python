@@ -64,3 +64,10 @@ class DeletingError(ControlPlaneError):
 
     reason = "ResourceDeleting"
     status_code = 409
+
+
+class QuotaExceededError(ControlPlaneError):
+    """命名空间配额超限：写入会超出资源条数或副本合计上限。"""
+
+    reason = "QuotaExceeded"
+    status_code = 403

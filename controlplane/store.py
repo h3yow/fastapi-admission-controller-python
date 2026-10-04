@@ -9,6 +9,7 @@ from typing import Any
 from .admission import AdmissionController
 from .errors import AlreadyExistsError, ConflictError, DeletingError, NotFoundError
 from .models import Resource
+from .quota import NamespaceQuota, QuotaManager
 
 
 class ResourceStore:
@@ -17,10 +18,19 @@ class ResourceStore:
     并发语义：所有变更操作都在同一把 asyncio.Lock 内完成
     「读取当前版本 -> 准入/版本校验 -> 写入」，因此并发写入被串行化，
     基于过期 resource_version 的写入必然以 Conflict 失败，不会静默覆盖。
+
+    配额语义：配额判定也在同一把锁内、基于当下真实用量完成，
+    判定通过才写入，因此并发创建/调大副本不会超卖；被拒绝的请求
+    不产生任何状态变化，也不占用额度。
     """
 
-    def __init__(self, admission: AdmissionController) -> None:
+    def __init__(
+        self,
+        admission: AdmissionController,
+        quota: QuotaManager | None = None,
+    ) -> None:
         self.admission = admission
+        self.quota = quota or QuotaManager()
         self._resources: dict[str, Resource] = {}
         self._lock = asyncio.Lock()
 
@@ -34,6 +44,8 @@ class ResourceStore:
                     f"resource {key} already exists",
                     details={"namespace": namespace, "name": name},
                 )
+            # 配额判定：基于锁内当下真实用量，超限则拒绝且不留状态。
+            self.quota.check_create(namespace, spec, self._resources.values())
             resource = Resource(namespace=namespace, name=name, spec=copy.deepcopy(spec))
             resource.resource_version = 1
             self._resources[key] = resource
@@ -64,6 +76,8 @@ class ResourceStore:
                         "current": resource.resource_version,
                     },
                 )
+            # 配额判定：按副本增量结算，调小必然放行，放大超限则拒绝。
+            self.quota.check_update(namespace, resource, spec, self._resources.values())
             resource.spec = copy.deepcopy(spec)
             resource.resource_version += 1
             resource.updated_at = time.time()
@@ -94,6 +108,25 @@ class ResourceStore:
     async def list(self) -> list[Resource]:
         async with self._lock:
             return list(self._resources.values())
+
+    async def quota_status(self, namespace: str) -> dict:
+        """容量视图：上限 + 当前用量 + 是否超配（锁内一致快照）。"""
+        async with self._lock:
+            return self.quota.status(namespace, self._resources.values())
+
+    async def set_quota(
+        self, namespace: str, max_resources: int, max_replicas: int
+    ) -> dict:
+        """按命名空间调整上限，返回调整后的容量视图。
+
+        允许调到低于当前用量：既有资源不受影响，仅后续放大性写入被拒。
+        """
+        async with self._lock:
+            self.quota.set_quota(
+                namespace,
+                NamespaceQuota(max_resources=max_resources, max_replicas=max_replicas),
+            )
+            return self.quota.status(namespace, self._resources.values())
 
     async def reconcile(self, namespace: str, name: str) -> Resource:
         """调和单个资源：让实际状态收敛到期望状态（幂等）。
